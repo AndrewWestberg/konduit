@@ -2,8 +2,9 @@ use bln_sdk::types::Invoice;
 use clap::Parser;
 use http_client::{codec, transport};
 use konduit_data::{Lock, SquashBody};
-use konduit_tmp::Keytag;
+use konduit_tmp::{Keytag, SessionClaimRequest};
 use std::io::{self, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     Adaptor,
@@ -106,10 +107,16 @@ impl Cli {
         let vk = self.signing_key.to_verification_key();
         let keytag = Keytag::new(&vk, &self.tag);
         let server_client = client_json(self.server_url.clone());
-        let adaptor = Adaptor::new(server_client, Some(&keytag)).await?;
-
+        let mut adaptor = Adaptor::new(server_client, Some(&keytag)).await?;
+        if matches!(
+            self.command,
+            Commands::Quote { .. } | Commands::Pay { .. } | Commands::Squash
+        ) {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+            let claim = SessionClaimRequest::signed(&self.signing_key, 1, [0; 32], vk.into(), now);
+            adaptor.claim_session(&claim).await?;
+        }
         let l2 = l2::Client::new(&adaptor, &self.signing_key);
-
         match &self.command {
             Commands::OwnInfo => {
                 println!("{}", vk);
