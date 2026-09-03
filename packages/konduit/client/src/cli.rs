@@ -127,6 +127,9 @@ async fn claim_cli_session<T: Transport>(
     let generation = cli
         .session_generation
         .ok_or_else(|| anyhow::anyhow!("--session-generation is required"))?;
+    if generation == 0 {
+        anyhow::bail!("--session-generation must be at least 1");
+    }
     let backup_hash = cli
         .session_backup_hash
         .ok_or_else(|| anyhow::anyhow!("--session-backup-hash is required"))?;
@@ -155,10 +158,18 @@ impl Cli {
         let keytag = Keytag::new(&vk, &self.tag);
         let server_client = client_json(self.server_url.clone());
         let mut adaptor = Adaptor::new(server_client, Some(&keytag)).await?;
-        let catalog_digest = AssetCatalog::load(self.asset_config.as_deref())?.digest()?;
-        if adaptor.info().asset_catalog_digest.as_deref() != Some(&catalog_digest) {
-            anyhow::bail!("asset catalog does not match adaptor discovery");
+        if !matches!(self.command, Commands::Info | Commands::OwnInfo) {
+            let catalog_digest = AssetCatalog::load(self.asset_config.as_deref())?.digest()?;
+            if adaptor.info().asset_catalog_digest.as_deref() != Some(&catalog_digest) {
+                anyhow::bail!("asset catalog does not match adaptor discovery");
+            }
         }
+        let parsed_invoice = match &self.command {
+            Commands::Quote { invoice } | Commands::Pay { invoice } => {
+                Some(invoice.parse::<Invoice>()?)
+            }
+            _ => None,
+        };
         let mut last_claim_timestamp = 0;
         let protected = matches!(
             self.command,
@@ -179,38 +190,18 @@ impl Cli {
 
             Commands::AddInvoice { .. } => {
                 todo!("Not yet impl")
-                //     let (lnd_url, lnd_macaroon) = self
-                //         .lnd_url
-                //         .as_deref()
-                //         .and_then(|url| Some((url, cli.lnd_macaroon.as_deref()?)))
-                //         .ok_or_else(|| anyhow!("LND credentials not provided"))?;
-
-                //     let http_client = client_json(lnd_url.to_string());
-
-                //     let json: serde_json::Value = http_client
-                //         .post_with_headers(
-                //             "/v1/invoices",
-                //             &[("Grpc-Metadata-macaroon", lnd_macaroon)],
-                //             serde_json::to_vec(&json!({ "value_msat": amount_msat, "memo": memo }))?,
-                //         )
-                //     .await?;
-
-                //     json["payment_request"]
-                //         .as_str()
-                //         .map(|s| println!("{s}"))
-                //         .ok_or_else(|| anyhow!("LND failed to return invoice: {}", json))?;
             }
 
-            Commands::Quote { invoice } => {
-                let invoice = invoice.parse::<Invoice>()?;
+            Commands::Quote { .. } => {
+                let invoice = parsed_invoice.unwrap();
                 let quote = l2::Client::new(&adaptor, &self.signing_key)
                     .quote(&invoice)
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&quote)?);
             }
 
-            Commands::Pay { invoice } => {
-                let invoice = invoice.parse::<Invoice>()?;
+            Commands::Pay { .. } => {
+                let invoice = parsed_invoice.unwrap();
                 let quote = l2::Client::new(&adaptor, &self.signing_key)
                     .quote(&invoice)
                     .await?;
@@ -226,8 +217,9 @@ impl Cli {
                     .pay(&invoice, &quote)
                     .await?;
                 let and_confirm = prompt_if_incomplete(&res, self.yes)?;
-
-                claim_cli_session(self, &mut adaptor, &mut last_claim_timestamp).await?;
+                if and_confirm {
+                    claim_cli_session(self, &mut adaptor, &mut last_claim_timestamp).await?;
+                }
                 l2::Client::new(&adaptor, &self.signing_key)
                     .sync(res, and_confirm, |x| known_lock(&x))
                     .await?;
@@ -238,7 +230,9 @@ impl Cli {
                     .squash(SquashBody::default())
                     .await?;
                 let and_confirm = prompt_if_incomplete(&res, self.yes)?;
-                claim_cli_session(self, &mut adaptor, &mut last_claim_timestamp).await?;
+                if and_confirm {
+                    claim_cli_session(self, &mut adaptor, &mut last_claim_timestamp).await?;
+                }
                 l2::Client::new(&adaptor, &self.signing_key)
                     .sync(res, and_confirm, |_x: konduit_data::Lock| known_lock(&_x))
                     .await?;
