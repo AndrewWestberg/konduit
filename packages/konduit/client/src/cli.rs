@@ -1,14 +1,15 @@
 use bln_sdk::types::Invoice;
 use clap::Parser;
-use http_client::{codec, transport};
-use konduit_data::{Lock, SquashBody};
+use http_client::{Transport, codec, transport};
+use konduit_data::{AssetCatalog, Lock, SquashBody};
 use konduit_tmp::{Keytag, SessionClaimRequest};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     Adaptor,
-    core::{SigningKey, SquashStatus, Tag},
+    core::{Hash, SigningKey, SquashStatus, Tag, VerificationKey},
     l2,
 };
 
@@ -26,6 +27,10 @@ pub struct Cli {
     )]
     pub server_url: String,
 
+    /// Optional JSON asset catalog; must match the adaptor's catalog digest.
+    #[arg(long, env = "KONDUIT_ASSET_CONFIG")]
+    pub asset_config: Option<PathBuf>,
+
     /// Hex encoded signing key
     #[arg(long, env = "KONDUIT_SIGNING_KEY")]
     pub signing_key: SigningKey,
@@ -33,6 +38,18 @@ pub struct Cli {
     /// Hex encoded Tag. Required.
     #[arg(long, env = "KONDUIT_TAG")]
     pub tag: Tag,
+
+    /// Monotonically increasing session generation persisted by the client.
+    #[arg(long, env = "KONDUIT_SESSION_GENERATION")]
+    pub session_generation: Option<u64>,
+
+    /// Hex-encoded hash of the current session backup.
+    #[arg(long, env = "KONDUIT_SESSION_BACKUP_HASH")]
+    pub session_backup_hash: Option<Hash<32>>,
+
+    /// Stable public identity of this client device.
+    #[arg(long, env = "KONDUIT_SESSION_DEVICE_KEY")]
+    pub session_device_key: Option<VerificationKey>,
 
     /// Optional LND REST URL
     #[arg(long, env = "LND_BASE_URL")]
@@ -102,21 +119,54 @@ pub fn client_json(base_url: String) -> http_client::Client<transport::Reqwest, 
     http_client::Client::new(transport(), codec::Json, base_url)
 }
 
+async fn claim_cli_session<T: Transport>(
+    cli: &Cli,
+    adaptor: &mut Adaptor<T>,
+    last_timestamp: &mut u64,
+) -> anyhow::Result<()> {
+    let generation = cli
+        .session_generation
+        .ok_or_else(|| anyhow::anyhow!("--session-generation is required"))?;
+    let backup_hash = cli
+        .session_backup_hash
+        .ok_or_else(|| anyhow::anyhow!("--session-backup-hash is required"))?;
+    let device_key = cli
+        .session_device_key
+        .ok_or_else(|| anyhow::anyhow!("--session-device-key is required"))?;
+    let adaptor_key: [u8; 32] = adaptor.info().channel_parameters.adaptor_key.into();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+    let now = now.max(last_timestamp.saturating_add(1));
+    let claim = SessionClaimRequest::signed(
+        &cli.signing_key,
+        adaptor_key,
+        generation,
+        backup_hash.into(),
+        device_key.into(),
+        now,
+    );
+    adaptor.claim_session(&claim).await?;
+    *last_timestamp = now;
+    Ok(())
+}
+
 impl Cli {
     pub async fn run(&self) -> anyhow::Result<()> {
         let vk = self.signing_key.to_verification_key();
         let keytag = Keytag::new(&vk, &self.tag);
         let server_client = client_json(self.server_url.clone());
         let mut adaptor = Adaptor::new(server_client, Some(&keytag)).await?;
-        if matches!(
+        let catalog_digest = AssetCatalog::load(self.asset_config.as_deref())?.digest()?;
+        if adaptor.info().asset_catalog_digest.as_deref() != Some(&catalog_digest) {
+            anyhow::bail!("asset catalog does not match adaptor discovery");
+        }
+        let mut last_claim_timestamp = 0;
+        let protected = matches!(
             self.command,
             Commands::Quote { .. } | Commands::Pay { .. } | Commands::Squash
-        ) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
-            let claim = SessionClaimRequest::signed(&self.signing_key, 1, [0; 32], vk.into(), now);
-            adaptor.claim_session(&claim).await?;
+        );
+        if protected {
+            claim_cli_session(self, &mut adaptor, &mut last_claim_timestamp).await?;
         }
-        let l2 = l2::Client::new(&adaptor, &self.signing_key);
         match &self.command {
             Commands::OwnInfo => {
                 println!("{}", vk);
@@ -153,13 +203,17 @@ impl Cli {
 
             Commands::Quote { invoice } => {
                 let invoice = invoice.parse::<Invoice>()?;
-                let quote = l2.quote(&invoice).await?;
+                let quote = l2::Client::new(&adaptor, &self.signing_key)
+                    .quote(&invoice)
+                    .await?;
                 println!("{}", serde_json::to_string_pretty(&quote)?);
             }
 
             Commands::Pay { invoice } => {
                 let invoice = invoice.parse::<Invoice>()?;
-                let quote = l2.quote(&invoice).await?;
+                let quote = l2::Client::new(&adaptor, &self.signing_key)
+                    .quote(&invoice)
+                    .await?;
 
                 println!("quote = {:?}", quote);
 
@@ -167,17 +221,26 @@ impl Cli {
                     return Ok(());
                 }
 
-                let res = l2.pay(&invoice, &quote).await?;
-
+                claim_cli_session(self, &mut adaptor, &mut last_claim_timestamp).await?;
+                let res = l2::Client::new(&adaptor, &self.signing_key)
+                    .pay(&invoice, &quote)
+                    .await?;
                 let and_confirm = prompt_if_incomplete(&res, self.yes)?;
 
-                l2.sync(res, and_confirm, |x| known_lock(&x)).await?;
+                claim_cli_session(self, &mut adaptor, &mut last_claim_timestamp).await?;
+                l2::Client::new(&adaptor, &self.signing_key)
+                    .sync(res, and_confirm, |x| known_lock(&x))
+                    .await?;
             }
 
             Commands::Squash => {
-                let res = l2.squash(SquashBody::default()).await?;
+                let res = l2::Client::new(&adaptor, &self.signing_key)
+                    .squash(SquashBody::default())
+                    .await?;
                 let and_confirm = prompt_if_incomplete(&res, self.yes)?;
-                l2.sync(res, and_confirm, |_x: konduit_data::Lock| known_lock(&_x))
+                claim_cli_session(self, &mut adaptor, &mut last_claim_timestamp).await?;
+                l2::Client::new(&adaptor, &self.signing_key)
+                    .sync(res, and_confirm, |_x: konduit_data::Lock| known_lock(&_x))
                     .await?;
             }
         }

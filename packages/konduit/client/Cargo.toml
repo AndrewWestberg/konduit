@@ -27,6 +27,7 @@ cli = [
   "dep:tokio",
   "http-client/reqwest",
   "serde_json",
+  "konduit-data/json",
 ]
 
 [dependencies]
