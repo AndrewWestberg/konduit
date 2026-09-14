@@ -11,7 +11,8 @@ use std::cmp;
 
 use cardano_sdk::VerificationKey;
 use konduit_data::{
-    AssetDefinition, AssetId, Locked, Secret, Squash, Stage, Tag, Unverified, Used, VerifyingKey,
+    AssetDefinition, AssetId, Lock, Locked, Secret, Squash, Stage, Tag, Unverified, Used,
+    VerifyingKey,
 };
 use konduit_tmp::{Keytag, Receipt, SquashProposal, from_verifying_key, receipt, to_verifying_key};
 
@@ -298,6 +299,11 @@ impl Channel {
             return Err(Error::Funds);
         }
         self.receipt_mut()?.apply_locked(locked)?;
+        Ok(())
+    }
+
+    pub fn cancel_locked(&mut self, index: u64, lock: &Lock) -> Result<(), Error> {
+        self.receipt_mut()?.remove_locked(index, lock)?;
         Ok(())
     }
 
