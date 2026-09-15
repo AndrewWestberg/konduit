@@ -71,6 +71,9 @@ impl From<db::Error> for Error {
             db::Error::AlreadyExists => Error::DbBackend("entry already exists".into()),
             db::Error::LeaseInvalid => Error::LeaseInvalid,
             db::Error::OperationConflict => Error::OperationConflict,
+            error @ (db::Error::PaymentNotFound
+            | db::Error::PaymentAmbiguous
+            | db::Error::PaymentAuthorizationInvalid) => Error::DbBackend(error.to_string()),
             db::Error::Channel(error) => Error::Channel(error),
         }
     }
@@ -294,10 +297,7 @@ impl Data {
         digest.update(minicbor::to_vec(&locked).map_err(|_| Error::Other)?);
         digest.update(invoice.to_string().as_bytes());
         let request_digest: [u8; 32] = digest.finalize().into();
-        let mut identity = Sha256::new();
-        identity.update(keytag.as_ref());
-        identity.update(locked.index().to_be_bytes());
-        let identity: [u8; 32] = identity.finalize().into();
+        let identity = db::payment_identity(keytag, payment_index);
         let inserted = self.db().reserve_payment(
             &identity,
             &request_digest,
@@ -317,7 +317,7 @@ impl Data {
         }
         match self.bln_pay(invoice, fee_limit, rel_timeout).await {
             Ok(pay_res) => Ok(PayResponse::from(pay_res.secret)),
-            Err(bln_client::Error::PaymentFailed(reason)) => {
+            Err(error) if error.is_terminal_payment_failure() => {
                 self.db().cancel_payment(
                     &identity,
                     &request_digest,
@@ -326,7 +326,7 @@ impl Data {
                     payment_index,
                     &payment_lock,
                 )?;
-                Err(Error::Bln(format!("Payment failed: {reason}")))
+                Err(Error::Bln(format!("Payment failed: {error}")))
             }
             Err(error) => Err(error.into()),
         }
